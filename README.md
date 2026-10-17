@@ -33,12 +33,22 @@ Set `SHODAN_API_KEY` to enable Shodan lookups.
 ```bash
 ./leakcheck.sh https://example.com
 ./leakcheck.sh --active https://example.com          # add intrusive scans (ports, banners, dir brute, nuclei)
+./leakcheck.sh -o out https://example.com            # save crawl + recon + findings.csv to ./out
+./leakcheck.sh --no-subs https://example.com         # scan only the given URLs, skip discovered subdomains
 ./leakcheck.sh https://app.example.com https://admin.example.com
 ./leakcheck.sh https://example.com && echo clean || echo "LEAKS FOUND"
 ./leakcheck.sh --help
 ```
 
-Passive recon runs by default. `--active` adds scans that touch the target directly (port scanning, banner grabbing, directory brute force, nuclei, zone-transfer attempts, subdomain brute) — only run it against assets you're authorized to test.
+### Flags
+
+| Flag | Effect |
+|---|---|
+| `--active` | Adds scans that touch the target directly: port/banner scan, directory brute force, nuclei, zone-transfer attempts, subdomain brute. Authorized targets only. |
+| `-o DIR` / `--out DIR` | Keeps the crawled `site/` mirror and every `recon_<domain>/` artifact in `DIR`, and writes `findings.csv` there when anything is flagged. Without `-o`, all crawled files are deleted at the end and only the summary prints. |
+| `--no-subs` | Scans only the URLs you pass. By default, every live subdomain discovered during recon is crawled and scanned too. |
+
+Passive recon runs by default. **Subdomains discovered via Certificate Transparency (and optional tools) are liveness-probed and the reachable ones are automatically crawled and scanned.** Use `--no-subs` to limit the scan to the exact URLs you pass.
 
 ## What it does
 
@@ -73,6 +83,14 @@ Passive recon runs by default. `--active` adds scans that touch the target direc
 21. Flags shell environment variables baked into bundles, such as `HOME`, `PATH` and `GH_TOKEN` appearing in JS.
 
 Secrets are never printed in full; output shows only the first few characters. Recon warnings (open zone transfer, wildcard DNS, reflected CORS, missing SPF/DMARC, possible takeover, open buckets, etc.) are summarized under **Recon findings** at the end of the run.
+
+## Output files (`-o DIR`)
+
+With `-o DIR`, the run leaves behind:
+
+- `DIR/site/` — the full crawled mirror plus `recon_<domain>/` directories (DNS, subdomains, WHOIS, headers, TLS, etc.).
+- `DIR/th.txt`, `DIR/gl.txt`, `DIR/th.json`, `DIR/gl.json` — raw TruffleHog/Gitleaks results.
+- `DIR/findings.csv` — one row per finding (written only when something is flagged), columns: `type,detail,file,status,value_prefix`. `type` is `secret:trufflehog`, `secret:gitleaks`, `bundle:shell-env`, `exposed-file`, or `recon-warning`; `status` is `LIVE`, `unverified`, `match`, or `warning`. Secret values are truncated to a short prefix.
 
 ## Output
 

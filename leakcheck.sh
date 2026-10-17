@@ -11,8 +11,13 @@ usage() {
 leakcheck.sh: full domain recon + scan live websites for leaked secrets/tokens
 
 USAGE
-  leakcheck.sh [--active] <url> [url ...]
+  leakcheck.sh [--active] [--no-subs] [-o DIR] <url> [url ...]
   leakcheck.sh -h | --help
+
+OUTPUT DIR (-o DIR)
+  Keeps the crawled site/ mirror and every recon_<domain>/ artifact in DIR, and
+  writes findings.csv there when anything is flagged. Without -o, all crawled
+  files are deleted when the run ends (only the summary prints).
 
 EXAMPLES
   leakcheck.sh https://example.com
@@ -38,7 +43,7 @@ WHAT IT DOES
     nc banner grab, directory brute (ffuf/gobuster), nuclei templates,
     testssl.sh full TLS audit
   Crawl + scan (always):
-    Mirrors each URL 2 levels deep: HTML, JS, CSS, JSON, sourcemaps
+    Mirrors each URL + every live discovered subdomain 2 levels deep: HTML, JS, CSS, JSON, sourcemaps
     Probes accidental exposures: /.env*, /.git/config, firebase init, etc.
     Extracts endpoints/secrets from JS (jsluice/LinkFinder/getJS if present)
     Runs TruffleHog (live key verification) + Gitleaks, plus optional
@@ -64,14 +69,19 @@ EOF
 
 # --- arg parsing ---
 ACTIVE=0
+OUT_DIR=""
+SCAN_SUBS=1
 ARGS=()
-for a in "$@"; do
-  case "$a" in
+while [ $# -gt 0 ]; do
+  case "$1" in
     --active) ACTIVE=1 ;;
+    -o|--out) shift; OUT_DIR="${1:-}"; [ -z "$OUT_DIR" ] && { echo "error: -o needs a directory"; exit 1; } ;;
+    --no-subs) SCAN_SUBS=0 ;;
     -h|--help) usage; exit 1 ;;
-    -*) echo "error: unknown flag '$a'"; echo; usage; exit 1 ;;
-    *) ARGS+=("$a") ;;
+    -*) echo "error: unknown flag '$1'"; echo; usage; exit 1 ;;
+    *) ARGS+=("$1") ;;
   esac
+  shift
 done
 set -- "${ARGS[@]:-}"
 [ "${1:-}" = "" ] && { usage; exit 1; }
@@ -305,18 +315,49 @@ recon_domain() {
 }
 
 mkdir -p site
+TARGETS=()
+
+# Phase 1: recon each input domain (also builds subdomains_all.txt per domain)
 for u in "$@"; do
   BASE=$(echo "$u" | sed -E 's#(https?://[^/]+).*#\1#')
   DOMAIN=$(echo "$BASE" | sed -E 's#https?://##')
-
   recon_domain "$BASE" "$DOMAIN"
+  TARGETS+=("$u")
+done
 
+# Phase 2: probe every discovered subdomain and add the live ones to the scan
+if [ "$SCAN_SUBS" = "1" ]; then
+  echo ""
+  echo "=== Subdomain liveness probe ==="
+  SUBS=$(cat site/recon_*/subdomains_all.txt 2>/dev/null | sort -u | grep -v '^$')
+  nsub=$(printf '%s\n' "$SUBS" | grep -c . || true)
+  echo "  $nsub unique subdomains discovered"
+  live_n=0
+  while IFS= read -r sub; do
+    [ -z "$sub" ] && continue
+    skip=0
+    for a in "$@"; do [ "$(echo "$a" | sed -E 's#https?://##; s#/.*##')" = "$sub" ] && skip=1; done
+    [ "$skip" = "1" ] && continue
+    for scheme in https http; do
+      code=$(curl -s -o /dev/null -m 8 -w '%{http_code}' -A "$UA" "$scheme://$sub" 2>/dev/null)
+      if [ -n "$code" ] && [ "$code" != "000" ]; then
+        TARGETS+=("$scheme://$sub"); live_n=$((live_n+1)); break
+      fi
+    done
+  done <<< "$SUBS"
+  echo "  $live_n live subdomains added to scan"
+fi
+
+# Phase 3: crawl + probe every target (input URLs + live subdomains)
+for u in "${TARGETS[@]}"; do
+  BASE=$(echo "$u" | sed -E 's#(https?://[^/]+).*#\1#')
+  DOMAIN=$(echo "$BASE" | sed -E 's#https?://##')
   wget -q -e robots=off -U "$UA" -r -l 2 -np -H -D "$DOMAIN" \
        -A 'html,htm,js,mjs,cjs,css,json,map,txt,env,xml,webmanifest' -P site "$u"
   for p in .env .env.local .env.production .env.development .git/config config.js env.js settings.json \
            asset-manifest.json manifest.json firebase.json __/firebase/init.json __/firebase/init.js \
            .well-known/security.txt robots.txt sitemap.xml _next/static/chunks/webpack.js; do
-    curl -sfL -A "$UA" "$BASE/$p" -o "site/exposed_$(echo "$p" | tr '/' '_')" 2>/dev/null
+    curl -sfL -A "$UA" "$BASE/$p" -o "site/exposed_${DOMAIN}_$(echo "$p" | tr '/' '_')" 2>/dev/null
   done
 done
 
@@ -339,8 +380,8 @@ n=$(find site -type f | wc -l | tr -d ' ')
 echo ""
 echo "Scanned $n files from: $*"
 echo "=== TruffleHog (verified = key is LIVE) ==="
-trufflehog filesystem site --no-update --json 2>/dev/null | \
-  jq -r '"[\(if .Verified then "LIVE" else "unverified" end)] \(.DetectorName)  \(.SourceMetadata.Data.Filesystem.file | sub("^site/";""))  -> \(.Raw[0:6])…"' | sort -u | tee th.txt
+trufflehog filesystem site --no-update --json 2>/dev/null > th.json
+jq -r '"[\(if .Verified then "LIVE" else "unverified" end)] \(.DetectorName)  \(.SourceMetadata.Data.Filesystem.file | sub("^site/";""))  -> \(.Raw[0:6])…"' th.json 2>/dev/null | sort -u | tee th.txt
 echo "=== Gitleaks ==="
 gitleaks dir site --no-banner --redact=90 --report-format json --report-path gl.json >/dev/null 2>&1
 jq -r '.[] | "[\(.RuleID)]  \(.File | sub(".*/site/";""))  -> \(.Secret[0:8])"' gl.json 2>/dev/null | sort -u | tee gl.txt
@@ -364,5 +405,30 @@ grep -rhi 'WARNING' site/recon_* 2>/dev/null | sort -u | tee recon_warn.txt
 
 live=$(grep -c '^\[LIVE\]' th.txt 2>/dev/null || true); live=${live:-0}
 total=$(( $(wc -l < th.txt) + $( [ -f gl.txt ] && wc -l < gl.txt || echo 0) + $( [ -f kf.txt ] && wc -l < kf.txt || echo 0) + $(wc -l < env.txt) ))
+reconw=$( [ -f recon_warn.txt ] && wc -l < recon_warn.txt | tr -d ' ' || echo 0 )
+expc=$( [ -f exp.txt ] && wc -l < exp.txt | tr -d ' ' || echo 0 )
+anyfind=$(( total + reconw + expc ))
+
+# Save crawl + recon artifacts and a findings CSV when -o DIR is given
+if [ -n "$OUT_DIR" ]; then
+  mkdir -p "$OUT_DIR"
+  cp -R site "$OUT_DIR/" 2>/dev/null
+  for r in th.txt th.json gl.txt gl.json kf.txt env.txt exp.txt recon_warn.txt; do [ -f "$r" ] && cp "$r" "$OUT_DIR/" 2>/dev/null; done
+  if [ "$anyfind" -gt 0 ]; then
+    CSV="$OUT_DIR/findings.csv"
+    {
+      echo "type,detail,file,status,value_prefix"
+      [ -f th.json ] && jq -r 'select(.DetectorName) | ["secret:trufflehog", .DetectorName, (.SourceMetadata.Data.Filesystem.file|sub("^site/";"")), (if .Verified then "LIVE" else "unverified" end), (.Raw[0:6])] | @csv' th.json 2>/dev/null | sort -u
+      [ -f gl.json ] && jq -r '.[] | ["secret:gitleaks", .RuleID, (.File|sub(".*/site/";"")), "match", (.Secret[0:8])] | @csv' gl.json 2>/dev/null | sort -u
+      while IFS= read -r f; do [ -n "$f" ] && printf '"bundle:shell-env","shell env vars baked into bundle","%s","warning",""\n' "$f"; done < env.txt
+      while IFS= read -r f; do [ -n "$f" ] && printf '"exposed-file","returned content","%s","warning",""\n' "$f"; done < exp.txt
+      while IFS= read -r w; do [ -n "$w" ] && printf '"recon-warning","%s","","warning",""\n' "$(echo "$w" | sed 's/^WARNING: //; s/\"/\"\"/g')"; done < recon_warn.txt
+    } > "$CSV"
+    echo "Saved crawl + recon to $OUT_DIR/  (findings CSV: $CSV)"
+  else
+    echo "Saved crawl + recon to $OUT_DIR/  (clean - no findings.csv written)"
+  fi
+fi
+
 echo "---"
 if [ "$total" -eq 0 ]; then echo "✓ No secrets found"; else echo "✗ $total secret finding(s), $live LIVE. Rotate LIVE ones immediately"; exit 2; fi
