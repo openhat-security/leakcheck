@@ -90,7 +90,7 @@ With `-o DIR`, the run leaves behind:
 
 - `DIR/site/` — the full crawled mirror plus `recon_<domain>/` directories (DNS, subdomains, WHOIS, headers, TLS, etc.).
 - `DIR/th.txt`, `DIR/gl.txt`, `DIR/th.json`, `DIR/gl.json` — raw TruffleHog/Gitleaks results.
-- `DIR/findings.csv` — one row per finding (written only when something is flagged), columns: `type,detail,file,status,value_prefix`. `type` is `secret:trufflehog`, `secret:gitleaks`, `bundle:shell-env`, `exposed-file`, or `recon-warning`; `status` is `LIVE`, `unverified`, `match`, or `warning`. Secret values are truncated to a short prefix.
+- `DIR/findings.csv` — one row per finding (written only when something is flagged), columns: `type,detail,file,status,value`. `type` is `secret:trufflehog`, `secret:gitleaks`, `bundle:shell-env`, `exposed-file`, or `recon-warning`; `status` is `LIVE`, `unverified`, `match`, or `warning`. The `value` column contains the **full raw secret** (properly CSV-escaped) so it can be fed straight into rotation tooling — treat `findings.csv` as sensitive and do not commit it.
 
 ## Output
 

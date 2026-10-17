@@ -422,9 +422,9 @@ if [ -n "$OUT_DIR" ]; then
   if [ "$anyfind" -gt 0 ]; then
     CSV="$OUT_DIR/findings.csv"
     {
-      echo "type,detail,file,status,value_prefix"
-      [ -f th.json ] && jq -r 'select(.DetectorName) | ["secret:trufflehog", .DetectorName, (.SourceMetadata.Data.Filesystem.file|sub("^site/";"")), (if .Verified then "LIVE" else "unverified" end), (.Raw[0:6])] | @csv' th.json 2>/dev/null | sort -u
-      [ -f gl.json ] && jq -r '.[] | ["secret:gitleaks", .RuleID, (.File|sub(".*/site/";"")), "match", (.Secret[0:8])] | @csv' gl.json 2>/dev/null | sort -u
+      echo "type,detail,file,status,value"
+      [ -f th.json ] && jq -r 'select(.DetectorName) | ["secret:trufflehog", .DetectorName, (.SourceMetadata.Data.Filesystem.file|sub("^site/";"")), (if .Verified then "LIVE" else "unverified" end), (.Raw // "")] | @csv' th.json 2>/dev/null | sort -u
+      [ -f gl.json ] && jq -r '.[] | ["secret:gitleaks", .RuleID, (.File|sub(".*/site/";"")), "match", (.Secret // "")] | @csv' gl.json 2>/dev/null | sort -u
       while IFS= read -r f; do [ -n "$f" ] && printf '"bundle:shell-env","shell env vars baked into bundle","%s","warning",""\n' "$f"; done < env.txt
       while IFS= read -r f; do [ -n "$f" ] && printf '"exposed-file","returned content","%s","warning",""\n' "$f"; done < exp.txt
       while IFS= read -r w; do [ -n "$w" ] && printf '"recon-warning","%s","","warning",""\n' "$(echo "$w" | sed 's/^WARNING: //; s/\"/\"\"/g')"; done < recon_warn.txt
