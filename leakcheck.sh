@@ -94,6 +94,11 @@ done
 
 set -uo pipefail
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+# resolve output dir to an absolute path before we cd into TMP (else it lands in TMP and gets wiped)
+if [ -n "$OUT_DIR" ]; then
+  mkdir -p "$OUT_DIR" || { echo "error: cannot create $OUT_DIR"; exit 1; }
+  OUT_DIR=$(cd "$OUT_DIR" && pwd)
+fi
 UA="Mozilla/5.0 leakcheck"
 cd "$TMP" || exit 1
 
@@ -277,7 +282,7 @@ recon_domain() {
       nmap -sV -Pn --top-ports 200 --open -T4 -oG "$OUT/nmap.gnmap" -oN "$OUT/nmap.txt" "$DOMAIN" >/dev/null 2>&1
       if have nc && [ -f "$OUT/nmap.gnmap" ]; then
         echo "  [active] nc banner grab"
-        for port in $(grep -oE '[0-9]+/open' "$OUT/nmap.gnmap" | cut -d/ -f1 | sort -un); do
+        grep -oE '[0-9]+/open' "$OUT/nmap.gnmap" | cut -d/ -f1 | sort -un | while read -r port; do
           echo "--- port $port ---" >> "$OUT/banners.txt"
           (printf 'HEAD / HTTP/1.0\r\n\r\n'; sleep 1) | nc -w 4 "$DOMAIN" "$port" 2>/dev/null | head -20 >> "$OUT/banners.txt"
         done
