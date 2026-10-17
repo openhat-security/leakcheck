@@ -388,7 +388,7 @@ echo "=== TruffleHog (verified = key is LIVE) ==="
 trufflehog filesystem site --no-update --json 2>/dev/null > th.json
 jq -r '"[\(if .Verified then "LIVE" else "unverified" end)] \(.DetectorName)  \(.SourceMetadata.Data.Filesystem.file | sub("^site/";""))  -> \(.Raw[0:6])…"' th.json 2>/dev/null | sort -u | tee th.txt
 echo "=== Gitleaks ==="
-gitleaks dir site --no-banner --redact=90 --report-format json --report-path gl.json >/dev/null 2>&1
+gitleaks dir site --no-banner --report-format json --report-path gl.json >/dev/null 2>&1
 jq -r '.[] | "[\(.RuleID)]  \(.File | sub(".*/site/";""))  -> \(.Secret[0:8])"' gl.json 2>/dev/null | sort -u | tee gl.txt
 : > kf.txt
 if have kingfisher; then
