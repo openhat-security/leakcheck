@@ -2,7 +2,7 @@
 
 Scan live websites for leaked API keys, tokens and secrets.
 
-Frontend build tools can quietly bake secrets into public JavaScript bundles. One example is a Vite config that spreads the whole `process.env` into `define`. `leakcheck.sh` mirrors what a browser (or an attacker) can download from your site and scans it with **TruffleHog** (800+ detectors, live verification) and **Gitleaks** (150+ rules).
+Frontend build tools can quietly bake secrets into public JavaScript bundles. `leakcheck.sh` mirrors what a browser (or an attacker) can download from your site and scans it with **TruffleHog** (800+ detectors, live verification) and **Gitleaks** (150+ rules).
 
 ## Install
 
@@ -54,7 +54,7 @@ Because of these exit codes, it can run as a CI gate after deploys.
 
 1. Revoke or rotate the key at the provider first. Deleting it from the site isn't enough, because old bundles stay cached on CDNs and old hosting releases.
 2. Check the provider's audit logs for use of the key.
-3. Fix the build so only intended public variables (for example `VITE_*` and `NEXT_PUBLIC_*`) reach the client.
+3. Fix the build so only intended public variables reach the client.
 4. Redeploy, delete old hosting releases, and run `leakcheck.sh` again.
 
 ## Legal
