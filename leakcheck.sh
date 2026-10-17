@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# leakcheck.sh: domain recon + live-web secret scanning.
-# Maps a domain's surface (DNS, subdomains, ports, HTTP/TLS posture), mirrors what a
-# browser or attacker can download, then scans everything with TruffleHog (800+
-# detectors, live-verified) and Gitleaks (150+ rules). Recon output is fed to the
-# scanners too, so secrets found in Wayback URLs, sourcemaps, or exposed files surface.
+# leakcheck.sh: full domain recon + live-web secret scanning, in one file.
+# Maps a domain's whole surface (DNS, email auth, subdomains, takeover risk, ports,
+# banners, HTTP/TLS posture, tech stack, OSINT, archived URLs), mirrors what a browser
+# or attacker can download, then scans everything with TruffleHog (800+ detectors,
+# live-verified) and Gitleaks (150+ rules). All recon output lands under site/ so the
+# scanners read it too: a secret in an archived URL or exposed file still surfaces.
 
 usage() {
   cat <<'EOF'
-leakcheck.sh: domain recon + scan live websites for leaked secrets/tokens
+leakcheck.sh: full domain recon + scan live websites for leaked secrets/tokens
 
 USAGE
   leakcheck.sh [--active] <url> [url ...]
@@ -15,27 +16,34 @@ USAGE
 
 EXAMPLES
   leakcheck.sh https://example.com
-  leakcheck.sh --active https://example.com          # add port scan, dir brute, nuclei, subdomain brute
+  leakcheck.sh --active https://example.com          # add intrusive scans (ports, dir brute, nuclei, banners)
   leakcheck.sh https://app.example.com https://admin.example.com
   leakcheck.sh https://example.com && echo clean || echo "LEAKS FOUND"
 
 WHAT IT DOES
   Recon (passive, default):
-    - DNS: every record type, DNSSEC, wildcard check, reverse DNS
-    - Subdomains: Certificate Transparency (crt.sh, certspotter) + optional tools
-    - Ownership: WHOIS (domain + resolved IPs), ASN/BGP
-    - HTTP posture: security headers, HTTP methods, CORS reflection
-    - TLS: certificate dates/issuer/SANs (openssl)
-    - OSINT: Wayback Machine URLs, urlscan.io, Shodan (if SHODAN_API_KEY set)
+    DNS            every record type + ANY dump, DNSSEC, wildcard, reverse DNS
+    Email auth     SPF, DMARC, common DKIM selectors, BIMI, MX
+    Subdomains     Certificate Transparency (crt.sh, certspotter) + optional tools
+    Takeover       dangling-CNAME fingerprint check
+    Ownership      WHOIS (domain + resolved IPs), ASN/BGP, IP geo
+    HTTP posture   security headers, HTTP methods, CORS reflection, WAF detect
+    Tech stack     Server/X-Powered-By, whatweb/wappalyzer (if present), favicon hash
+    TLS            certificate dates/issuer/SANs (openssl)
+    URLs           robots.txt + sitemap.xml, Wayback, gau/waybackurls, urlscan
+    OSINT          Shodan (if SHODAN_API_KEY), cloud-bucket name guesses
+    GraphQL        introspection probe
   Recon (active, with --active):
-    - DNS zone transfer (AXFR), subdomain brute force
-    - Port scan + service/banner (nmap), directory brute (ffuf/gobuster), nuclei templates
+    DNS zone transfer (AXFR), subdomain brute force, nmap port+service scan,
+    nc banner grab, directory brute (ffuf/gobuster), nuclei templates,
+    testssl.sh full TLS audit
   Crawl + scan (always):
-    - Mirrors each URL 2 levels deep: HTML, JS, CSS, JSON, sourcemaps
-    - Probes accidental exposures: /.env*, /.git/config, firebase init, etc.
-    - Runs TruffleHog (live key verification) + Gitleaks, plus optional
-      Kingfisher / detect-secrets if installed
-    - Flags shell env baked into bundles (HOME/PATH/GH_TOKEN in JS)
+    Mirrors each URL 2 levels deep: HTML, JS, CSS, JSON, sourcemaps
+    Probes accidental exposures: /.env*, /.git/config, firebase init, etc.
+    Extracts endpoints/secrets from JS (jsluice/LinkFinder/getJS if present)
+    Runs TruffleHog (live key verification) + Gitleaks, plus optional
+      Kingfisher / detect-secrets / Nosey Parker if installed
+    Flags shell env baked into bundles (HOME/PATH/GH_TOKEN in JS)
   Secrets are never printed in full, only the first few chars.
 
 OUTPUT
@@ -46,9 +54,11 @@ EXIT CODES
   0 = nothing found    2 = findings    1 = bad usage / missing tools
 
 REQUIRES
-  brew install trufflehog gitleaks wget jq      # core (also need curl, dig, whois)
+  brew install trufflehog gitleaks wget jq       # core (also need curl, dig, whois)
 OPTIONAL (enable more recon when present)
-  nmap ffuf gobuster nuclei testssl.sh subfinder amass assetfinder findomain kingfisher detect-secrets
+  nmap nc ffuf gobuster nuclei testssl.sh wafw00f whatweb wappalyzer
+  subfinder amass assetfinder findomain gau waybackurls
+  jsluice linkfinder getJS kingfisher detect-secrets nosey_parker
 EOF
 }
 
@@ -69,7 +79,7 @@ for u in "$@"; do [[ "$u" =~ ^https?:// ]] || { echo "error: '$u' must start wit
 
 # --- dependency check ---
 for t in trufflehog gitleaks wget jq curl dig whois; do
-  command -v "$t" >/dev/null || { echo "error: missing '$t'. Core deps: brew install trufflehog gitleaks wget jq (curl, dig, whois are usually preinstalled)"; exit 1; }
+  command -v "$t" >/dev/null || { echo "error: missing '$t'. Core deps: brew install trufflehog gitleaks wget jq (curl, dig, whois usually preinstalled)"; exit 1; }
 done
 
 set -uo pipefail
@@ -86,9 +96,9 @@ recon_domain() {
   echo ""
   echo "=== RECON: $DOMAIN ==="
 
-  # [1] DNS records (all types)
+  # [1] DNS records (all types) + ANY dump
   echo "  [dns] records"
-  for rt in A AAAA CNAME MX TXT NS SOA SRV CAA DNSKEY DS NSEC NSEC3 SSHFP TLSA SVCB HTTPS SMIMEA; do
+  for rt in A AAAA CNAME MX TXT NS SOA SRV CAA DNSKEY DS NSEC NSEC3 SSHFP TLSA SVCB HTTPS SMIMEA PTR NAPTR; do
     r=$(dig +short "$DOMAIN" "$rt" 2>/dev/null)
     [ -n "$r" ] && printf '%s: %s\n' "$rt" "$r" >> "$OUT/dns_records.txt"
   done
@@ -109,7 +119,21 @@ recon_domain() {
     echo "$ip -> ${ptr:-no PTR}" > "$OUT/reverse_dns.txt"
   fi
 
-  # [5] Subdomains - passive (Certificate Transparency)
+  # [5] Email authentication records (SPF / DMARC / DKIM / BIMI / MX)
+  echo "  [email] spf / dmarc / dkim / bimi"
+  { dig +short TXT "$DOMAIN" 2>/dev/null | grep -i 'v=spf1' | sed 's/^/SPF: /'
+    dig +short TXT "_dmarc.${DOMAIN}" 2>/dev/null | grep -i 'v=DMARC1' | sed 's/^/DMARC: /'
+    dig +short TXT "default._bimi.${DOMAIN}" 2>/dev/null | sed 's/^/BIMI: /'
+    for sel in default google selector1 selector2 k1 k2 mail smtp dkim mandrill mailjet sendgrid s1 s2 zoho; do
+      d=$(dig +short TXT "${sel}._domainkey.${DOMAIN}" 2>/dev/null)
+      [ -n "$d" ] && echo "DKIM[$sel]: present"
+    done
+    dig +short MX "$DOMAIN" 2>/dev/null | sed 's/^/MX: /'
+  } > "$OUT/email_auth.txt"
+  grep -qi 'v=spf1' "$OUT/email_auth.txt" || echo "WARNING: no SPF record" >> "$OUT/email_auth.txt"
+  grep -qi 'DMARC:' "$OUT/email_auth.txt" || echo "WARNING: no DMARC record" >> "$OUT/email_auth.txt"
+
+  # [6] Subdomains - passive (Certificate Transparency)
   echo "  [subs] certificate transparency"
   curl -sf -A "$UA" "https://crt.sh/?q=%25.${DOMAIN}&output=json" 2>/dev/null \
     | jq -r '.[].name_value' 2>/dev/null | sed 's/\*\.//g' | tr ',' '\n' | sort -u > "$OUT/subs_crtsh.txt"
@@ -126,57 +150,96 @@ recon_domain() {
       esac
     fi
   done
-  cat "$OUT"/subs_*.txt 2>/dev/null | sort -u | grep -v '^$' > "$OUT/subdomains_all.txt"
+  cat "$OUT"/subs_*.txt 2>/dev/null | sed 's/^\.//' | grep -iE "\.?${DOMAIN}\$" | sort -u | grep -v '^$' > "$OUT/subdomains_all.txt"
 
-  # [6] WHOIS (domain + resolved IPs) and ASN
-  echo "  [whois] domain + IPs"
+  # [7] Subdomain takeover check (dangling CNAME -> known provider fingerprints)
+  if [ -s "$OUT/subdomains_all.txt" ]; then
+    echo "  [takeover] dangling CNAME scan"
+    while read -r sub; do
+      cn=$(dig +short CNAME "$sub" 2>/dev/null | head -1)
+      [ -z "$cn" ] && continue
+      if echo "$cn" | grep -qiE 'github\.io|herokuapp\.com|herokudns\.com|s3\.amazonaws\.com|cloudfront\.net|azurewebsites\.net|cloudapp\.net|trafficmanager\.net|wpengine\.com|pantheonsite\.io|ghost\.io|netlify\.app|readme\.io|surge\.sh|fastly\.net|zendesk\.com|freshdesk\.com|unbouncepages\.com|bitbucket\.io|helpscoutdocs\.com|statuspage\.io|launchrock\.com|shopify\.com'; then
+        body=$(curl -sfL -m 8 -A "$UA" "https://${sub}" 2>/dev/null)
+        if echo "$body" | grep -qiE "no such app|there isn't a github pages|NoSuchBucket|do not have a site configured|The specified bucket does not exist|project not found|Repository not found|herokucdn|not been claimed|unrecognized domain|404 Not Found.*Fastly|Sorry, this shop is currently unavailable"; then
+          echo "WARNING: possible subdomain takeover: ${sub} -> ${cn}" >> "$OUT/takeover.txt"
+        fi
+      fi
+    done < "$OUT/subdomains_all.txt"
+  fi
+
+  # [8] WHOIS (domain + resolved IPs), ASN, geo
+  echo "  [whois] domain + IPs + asn"
   whois "$DOMAIN" 2>/dev/null > "$OUT/whois_domain.txt"
-  for ip in $(dig +short "$DOMAIN" A 2>/dev/null | grep -E '^[0-9.]+$'); do
-    whois "$ip" 2>/dev/null | grep -iE '^(netname|orgname|org-name|descr|country|cidr|inetnum|origin|route)' >> "$OUT/whois_ip.txt"
-    curl -sf "https://bgp.tools/api/v1/prefixes?prefix=$ip/32" 2>/dev/null | jq -r '.[]? | "\(.prefix) -> AS\(.asn)"' 2>/dev/null >> "$OUT/asn.txt"
+  for i in $(dig +short "$DOMAIN" A 2>/dev/null | grep -E '^[0-9.]+$'); do
+    whois "$i" 2>/dev/null | grep -iE '^(netname|orgname|org-name|descr|country|cidr|inetnum|origin|route)' >> "$OUT/whois_ip.txt"
+    curl -sf "https://bgp.tools/api/v1/prefixes?prefix=$i/32" 2>/dev/null | jq -r '.[]? | "\(.prefix) -> AS\(.asn)"' 2>/dev/null >> "$OUT/asn.txt"
+    curl -sf "https://ipinfo.io/$i/json" 2>/dev/null | jq -r '"\(.ip) \(.city // "?"), \(.region // "?"), \(.country // "?") (\(.org // "?"))"' 2>/dev/null >> "$OUT/ip_geo.txt"
   done
 
-  # [7] HTTP security headers, methods, CORS
-  echo "  [http] headers / methods / cors"
+  # [9] HTTP security headers, methods, CORS, WAF
+  echo "  [http] headers / methods / cors / waf"
   curl -sI -A "$UA" "$BASE" 2>/dev/null \
-    | grep -iE '^(strict-transport-security|content-security-policy|x-frame-options|x-content-type-options|referrer-policy|permissions-policy|set-cookie|server|x-powered-by):' > "$OUT/headers.txt"
+    | grep -iE '^(strict-transport-security|content-security-policy|x-frame-options|x-content-type-options|referrer-policy|permissions-policy|set-cookie|server|x-powered-by|x-aspnet-version|via):' > "$OUT/headers.txt"
+  for h in strict-transport-security content-security-policy x-frame-options x-content-type-options; do
+    grep -qi "^$h:" "$OUT/headers.txt" || echo "WARNING: missing header $h" >> "$OUT/headers_missing.txt"
+  done
   for m in OPTIONS TRACE PUT DELETE PATCH; do
     code=$(curl -s -o /dev/null -w '%{http_code}' -X "$m" -A "$UA" "$BASE" 2>/dev/null)
     echo "$m: $code" >> "$OUT/http_methods.txt"
+    { [ "$m" = "TRACE" ] && [ "$code" = "200" ]; } && echo "WARNING: TRACE enabled (XST)" >> "$OUT/http_methods.txt"
   done
   local acao; acao=$(curl -sI -A "$UA" -H "Origin: https://evil.example" "$BASE" 2>/dev/null | grep -i '^access-control-allow-origin:')
-  if echo "$acao" | grep -qi 'evil.example\|\*'; then
-    echo "WARNING: CORS reflects arbitrary origin -> $acao" > "$OUT/cors.txt"
+  echo "$acao" | grep -qi 'evil.example\|\*' && echo "WARNING: CORS reflects arbitrary origin -> $acao" > "$OUT/cors.txt"
+  if have wafw00f; then wafw00f "$BASE" 2>/dev/null | grep -iE 'is behind|seems to be behind|No WAF' > "$OUT/waf.txt"; fi
+
+  # [10] Technology fingerprint + favicon hash
+  echo "  [tech] fingerprint / favicon"
+  if have whatweb; then whatweb -q --color=never "$BASE" 2>/dev/null > "$OUT/whatweb.txt"
+  elif have wappalyzer; then wappalyzer "$BASE" 2>/dev/null > "$OUT/wappalyzer.txt"; fi
+  curl -sfL -m 10 -A "$UA" "$BASE/favicon.ico" -o "$OUT/favicon.ico" 2>/dev/null
+  if [ -s "$OUT/favicon.ico" ]; then
+    if have md5sum; then fh=$(md5sum "$OUT/favicon.ico" | awk '{print $1}'); else fh=$(md5 -q "$OUT/favicon.ico" 2>/dev/null); fi
+    echo "favicon md5: $fh (pivot on Shodan: http.favicon.hash)" > "$OUT/favicon_hash.txt"
   fi
 
-  # [8] TLS certificate
+  # [11] TLS certificate
   echo "  [tls] certificate"
   if have openssl; then
     echo | openssl s_client -connect "${DOMAIN}:443" -servername "$DOMAIN" 2>/dev/null \
       | openssl x509 -noout -dates -subject -issuer -ext subjectAltName 2>/dev/null > "$OUT/tls_cert.txt"
   fi
-  if [ "$ACTIVE" = "1" ] && have testssl.sh; then
-    echo "  [tls] testssl.sh (active)"
-    testssl.sh --quiet --color 0 "$DOMAIN" 2>/dev/null > "$OUT/testssl.txt"
-  fi
 
-  # [9] OSINT - Wayback, urlscan, Shodan
-  echo "  [osint] wayback / urlscan / shodan"
-  curl -sf "http://web.archive.org/cdx/search/cdx?url=${DOMAIN}*&output=text&fl=original&collapse=urlkey&limit=500" 2>/dev/null > "$OUT/wayback.txt"
+  # [12] URL discovery: robots, sitemap, Wayback, gau/waybackurls, urlscan
+  echo "  [urls] robots / sitemap / wayback / urlscan"
+  curl -sfL -m 10 -A "$UA" "$BASE/robots.txt"  -o "$OUT/robots.txt" 2>/dev/null
+  curl -sfL -m 10 -A "$UA" "$BASE/sitemap.xml" -o "$OUT/sitemap.xml" 2>/dev/null
+  curl -sf "http://web.archive.org/cdx/search/cdx?url=${DOMAIN}*&output=text&fl=original&collapse=urlkey&limit=1000" 2>/dev/null > "$OUT/wayback.txt"
+  if have gau; then gau --threads 5 "$DOMAIN" 2>/dev/null | sort -u >> "$OUT/wayback.txt"
+  elif have waybackurls; then echo "$DOMAIN" | waybackurls 2>/dev/null | sort -u >> "$OUT/wayback.txt"; fi
   curl -sf -A "$UA" "https://urlscan.io/api/v1/search/?q=domain:${DOMAIN}&size=100" 2>/dev/null | jq -r '.results[]?.page.url' 2>/dev/null > "$OUT/urlscan.txt"
+
+  # [13] OSINT: Shodan + cloud-bucket name guesses
+  echo "  [osint] shodan / buckets"
   if [ -n "${SHODAN_API_KEY:-}" ]; then
     curl -sf "https://api.shodan.io/dns/domain/${DOMAIN}?key=${SHODAN_API_KEY}" 2>/dev/null | jq . > "$OUT/shodan_dns.json" 2>/dev/null
     [ -n "${ip:-}" ] && curl -sf "https://api.shodan.io/shodan/host/${ip}?key=${SHODAN_API_KEY}" 2>/dev/null | jq . > "$OUT/shodan_host.json" 2>/dev/null
   fi
+  local stem; stem=$(echo "$DOMAIN" | sed -E 's/\.[a-z]+$//; s/\./-/g')
+  for b in "$stem" "${stem}-assets" "${stem}-static" "${stem}-media" "${stem}-backup" "${stem}-backups" "${stem}-uploads" "${stem}-prod" "${stem}-dev" "${stem}-files"; do
+    c=$(curl -s -o /dev/null -w '%{http_code}' -m 6 "https://${b}.s3.amazonaws.com/" 2>/dev/null)
+    [ "$c" = "200" ] && echo "WARNING: open S3 bucket https://${b}.s3.amazonaws.com/ ($c)" >> "$OUT/buckets.txt"
+    g=$(curl -s -o /dev/null -w '%{http_code}' -m 6 "https://storage.googleapis.com/${b}/" 2>/dev/null)
+    [ "$g" = "200" ] && echo "WARNING: open GCS bucket https://storage.googleapis.com/${b}/ ($g)" >> "$OUT/buckets.txt"
+  done
 
-  # [10] GraphQL introspection
+  # [14] GraphQL introspection
   local gql; gql=$(curl -sf -A "$UA" -X POST "$BASE/graphql" -H 'Content-Type: application/json' \
     -d '{"query":"{__schema{types{name}}}"}' 2>/dev/null)
-  echo "$gql" | grep -q '__schema\|"types"' && echo "$gql" > "$OUT/graphql_introspection.json"
+  echo "$gql" | grep -q '__schema\|"types"' && { echo "$gql" > "$OUT/graphql_introspection.json"; echo "WARNING: GraphQL introspection enabled at $BASE/graphql" >> "$OUT/graphql.txt"; }
 
   # --- ACTIVE-only phases ---
   if [ "$ACTIVE" = "1" ]; then
-    # Zone transfer (AXFR)
+    # [A1] Zone transfer (AXFR)
     echo "  [active] zone transfer attempt"
     for ns in $(dig +short NS "$DOMAIN" 2>/dev/null); do
       axfr=$(dig axfr "$DOMAIN" @"$ns" +time=5 +tries=1 2>/dev/null)
@@ -186,25 +249,32 @@ recon_domain() {
       fi
     done
 
-    # Subdomain brute (small high-signal list)
+    # [A2] Subdomain brute (high-signal list), merged into subdomains_all
     echo "  [active] subdomain brute"
     for sub in www api admin dev staging stg test qa uat prod internal intranet backup db mail smtp \
                ftp sftp git gitlab jenkins ci cd build deploy vault consul grafana kibana elastic \
                redis mongo postgres mysql s3 storage cdn static assets uploads files docs wiki \
                portal dashboard login auth sso oauth idp vpn proxy gateway status health metrics \
-               logs sentry webhook graphql ws v1 v2 v3 app console panel phpmyadmin adminer; do
+               logs sentry webhook graphql ws v1 v2 v3 app console panel phpmyadmin adminer beta demo; do
       r=$(dig +short "${sub}.${DOMAIN}" A 2>/dev/null | grep -E '^[0-9.]+$')
-      [ -n "$r" ] && echo "${sub}.${DOMAIN} -> $r" >> "$OUT/subs_bruteforce.txt"
+      [ -n "$r" ] && echo "${sub}.${DOMAIN}" >> "$OUT/subs_bruteforce.txt"
     done
-    [ -f "$OUT/subs_bruteforce.txt" ] && cat "$OUT/subs_bruteforce.txt" | awk '{print $1}' >> "$OUT/subdomains_all.txt" && sort -u "$OUT/subdomains_all.txt" -o "$OUT/subdomains_all.txt"
+    if [ -f "$OUT/subs_bruteforce.txt" ]; then cat "$OUT/subs_bruteforce.txt" "$OUT/subdomains_all.txt" 2>/dev/null | sort -u > "$OUT/.sub.tmp" && mv "$OUT/.sub.tmp" "$OUT/subdomains_all.txt"; fi
 
-    # Port scan
+    # [A3] Port scan + [A4] banner grab
     if have nmap; then
       echo "  [active] nmap top ports"
-      nmap -sV -Pn --top-ports 200 --open -T4 -oN "$OUT/nmap.txt" "$DOMAIN" >/dev/null 2>&1
+      nmap -sV -Pn --top-ports 200 --open -T4 -oG "$OUT/nmap.gnmap" -oN "$OUT/nmap.txt" "$DOMAIN" >/dev/null 2>&1
+      if have nc && [ -f "$OUT/nmap.gnmap" ]; then
+        echo "  [active] nc banner grab"
+        for port in $(grep -oE '[0-9]+/open' "$OUT/nmap.gnmap" | cut -d/ -f1 | sort -un); do
+          echo "--- port $port ---" >> "$OUT/banners.txt"
+          (printf 'HEAD / HTTP/1.0\r\n\r\n'; sleep 1) | nc -w 4 "$DOMAIN" "$port" 2>/dev/null | head -20 >> "$OUT/banners.txt"
+        done
+      fi
     fi
 
-    # Directory brute
+    # [A5] Directory brute
     local wl=""
     for cand in /usr/share/wordlists/dirb/common.txt /opt/homebrew/share/wordlists/dirb/common.txt /usr/share/seclists/Discovery/Web-Content/common.txt; do
       [ -f "$cand" ] && { wl="$cand"; break; }
@@ -219,11 +289,17 @@ recon_domain() {
       fi
     fi
 
-    # Nuclei
+    # [A6] nuclei
     if have nuclei; then
       echo "  [active] nuclei (exposures/misconfig/cves)"
       nuclei -u "$BASE" -t http/exposures/ -t http/misconfiguration/ -t http/cves/ \
         -severity medium,high,critical -jsonl -o "$OUT/nuclei.jsonl" -silent 2>/dev/null
+    fi
+
+    # [A7] testssl.sh full TLS audit
+    if have testssl.sh; then
+      echo "  [active] testssl.sh"
+      testssl.sh --quiet --color 0 "$DOMAIN" 2>/dev/null > "$OUT/testssl.txt"
     fi
   fi
 }
@@ -244,9 +320,20 @@ for u in "$@"; do
   done
 done
 
+# Fetch sourcemaps for every JS file
 find site -name '*.js' | while read -r f; do
   rel=${f#site/}; curl -sfL -A "$UA" "https://$rel.map" -o "$f.map" 2>/dev/null
 done
+
+# Extract endpoints/secrets from JS bundles (optional tools)
+if have jsluice || have linkfinder || have getJS; then
+  echo "=== JS endpoint/secret extraction ==="
+  find site -name '*.js' | while read -r f; do
+    if have jsluice; then jsluice urls "$f" 2>/dev/null; jsluice secrets "$f" 2>/dev/null
+    elif have linkfinder; then linkfinder -i "$f" -o cli 2>/dev/null; fi
+  done | sort -u > site/js_endpoints.txt
+  [ -s site/js_endpoints.txt ] && echo "  $(wc -l < site/js_endpoints.txt | tr -d ' ') endpoints/strings -> site/js_endpoints.txt"
+fi
 
 n=$(find site -type f | wc -l | tr -d ' ')
 echo ""
@@ -261,6 +348,9 @@ jq -r '.[] | "[\(.RuleID)]  \(.File | sub(".*/site/";""))  -> \(.Secret[0:8])"' 
 if have kingfisher; then
   echo "=== Kingfisher ==="
   kingfisher scan site --format json 2>/dev/null | jq -r '.findings[]? | "[\(.rule.id // .rule_id)]  \(.path // .file)"' 2>/dev/null | sort -u | tee kf.txt
+elif have nosey_parker; then
+  echo "=== Nosey Parker ==="
+  nosey_parker scan --datastore "$TMP/np" site >/dev/null 2>&1 && nosey_parker report --datastore "$TMP/np" 2>/dev/null | grep -iE 'rule|finding' | sort -u | tee kf.txt
 elif have detect-secrets; then
   echo "=== detect-secrets ==="
   detect-secrets scan site 2>/dev/null | jq -r '.results | keys[]' 2>/dev/null | sort -u | tee kf.txt

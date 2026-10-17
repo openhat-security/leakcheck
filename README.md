@@ -1,8 +1,8 @@
 # leakcheck
 
-Domain reconnaissance + live-website secret scanning, in one script.
+Full domain reconnaissance + live-website secret scanning, in one script.
 
-Frontend build tools quietly bake secrets into public JavaScript bundles, and a domain's wider surface (forgotten subdomains, open ports, sloppy headers, archived URLs) leaks just as much. `leakcheck.sh` first maps the surface, then mirrors what a browser or an attacker can download and scans all of it with **TruffleHog** (800+ detectors, live verification) and **Gitleaks** (150+ rules).
+Frontend build tools quietly bake secrets into public JavaScript bundles, and a domain's wider surface — forgotten subdomains, dangling CNAMEs, open ports, missing email auth, sloppy headers, archived URLs, open buckets — leaks just as much. `leakcheck.sh` maps the whole surface first, then mirrors what a browser or an attacker can download and scans all of it with **TruffleHog** (800+ detectors, live verification) and **Gitleaks** (150+ rules). Every recon artifact lands under `site/`, so the scanners read it too.
 
 ## Install
 
@@ -17,47 +17,62 @@ On Linux, install `trufflehog` and `gitleaks` from their GitHub releases, and `w
 
 ### Optional tools (more recon when present)
 
-`nmap`, `ffuf` or `gobuster`, `nuclei`, `testssl.sh`, `subfinder`/`amass`/`assetfinder`/`findomain`, `kingfisher` or `detect-secrets`. The script auto-detects each and skips what's missing. Set `SHODAN_API_KEY` to enable Shodan lookups.
+The script auto-detects each and skips what's missing:
+
+- **Active scanning:** `nmap`, `nc`, `ffuf` or `gobuster`, `nuclei`, `testssl.sh`
+- **Fingerprinting:** `wafw00f`, `whatweb` or `wappalyzer`
+- **Subdomains:** `subfinder`, `amass`, `assetfinder`, `findomain`
+- **URL harvesting:** `gau`, `waybackurls`
+- **JS extraction:** `jsluice`, `linkfinder`, `getJS`
+- **Extra secret scanners:** `kingfisher`, `nosey_parker`, `detect-secrets`
+
+Set `SHODAN_API_KEY` to enable Shodan lookups.
 
 ## Usage
 
 ```bash
 ./leakcheck.sh https://example.com
-./leakcheck.sh --active https://example.com          # add port scan, dir brute, nuclei, subdomain brute, AXFR
+./leakcheck.sh --active https://example.com          # add intrusive scans (ports, banners, dir brute, nuclei)
 ./leakcheck.sh https://app.example.com https://admin.example.com
 ./leakcheck.sh https://example.com && echo clean || echo "LEAKS FOUND"
 ./leakcheck.sh --help
 ```
 
-Passive recon runs by default. `--active` adds scans that touch the target directly (port scanning, directory brute force, nuclei, subdomain brute, zone-transfer attempts) — only run it against assets you're authorized to test.
+Passive recon runs by default. `--active` adds scans that touch the target directly (port scanning, banner grabbing, directory brute force, nuclei, zone-transfer attempts, subdomain brute) — only run it against assets you're authorized to test.
 
 ## What it does
 
-**Recon (passive, default)**
+### Recon — passive (default)
 
-1. **DNS** — every record type, DNSSEC, wildcard detection, reverse DNS.
-2. **Subdomains** — Certificate Transparency (crt.sh, certspotter), plus subfinder/amass/assetfinder/findomain if installed.
-3. **Ownership** — WHOIS for the domain and each resolved IP, ASN/BGP lookup.
-4. **HTTP posture** — security headers, allowed HTTP methods, CORS origin reflection.
-5. **TLS** — certificate dates, issuer and SANs via `openssl` (full audit with `testssl.sh` in active mode).
-6. **OSINT** — Wayback Machine URLs, urlscan.io, Shodan (with `SHODAN_API_KEY`).
-7. **GraphQL** — introspection check on `/graphql`.
+1. **DNS** — every record type, full `ANY` dump, DNSSEC, wildcard detection, reverse DNS.
+2. **Email auth** — SPF, DMARC, common DKIM selectors, BIMI, MX; warns when SPF/DMARC are absent.
+3. **Subdomains** — Certificate Transparency (crt.sh, certspotter), plus subfinder/amass/assetfinder/findomain if installed.
+4. **Subdomain takeover** — flags dangling CNAMEs pointing at unclaimed providers (GitHub Pages, S3, Heroku, Netlify, Shopify, etc.).
+5. **Ownership** — WHOIS for the domain and each resolved IP, ASN/BGP lookup, IP geolocation.
+6. **HTTP posture** — security headers (and which are missing), allowed HTTP methods (flags TRACE/XST), CORS origin reflection, WAF detection.
+7. **Tech stack** — `Server`/`X-Powered-By`, whatweb/wappalyzer fingerprint, favicon hash for Shodan pivoting.
+8. **TLS** — certificate dates, issuer and SANs via `openssl`.
+9. **URLs** — robots.txt, sitemap.xml, Wayback Machine, gau/waybackurls, urlscan.io.
+10. **OSINT** — Shodan (with `SHODAN_API_KEY`), open S3/GCS cloud-bucket name guesses.
+11. **GraphQL** — introspection probe on `/graphql`.
 
-**Recon (active, `--active`)**
+### Recon — active (`--active`)
 
-8. DNS zone transfer (AXFR) against each nameserver.
-9. Subdomain brute force (high-signal wordlist).
-10. Port scan + service detection (`nmap`), directory brute force (`ffuf`/`gobuster`), `nuclei` templates (exposures, misconfig, CVEs).
+12. DNS zone transfer (AXFR) against each nameserver.
+13. Subdomain brute force (high-signal wordlist), merged into the subdomain list.
+14. Port scan + service detection (`nmap`) and banner grabbing (`nc`) on open ports.
+15. Directory brute force (`ffuf`/`gobuster`), `nuclei` templates (exposures, misconfig, CVEs), full TLS audit (`testssl.sh`).
 
-**Crawl + scan (always)**
+### Crawl + scan (always)
 
-11. Mirrors each URL two levels deep on the same domain: HTML, JS, CSS, JSON, sourcemaps.
-12. Fetches `.map` sourcemaps for every JS file, since they often contain original source.
-13. Probes accidental exposures: `/.env*`, `/.git/config`, `/__/firebase/init.json`, `firebase.json`, `asset-manifest.json` and similar.
-14. Runs TruffleHog (live key verification) and Gitleaks, plus Kingfisher or detect-secrets if installed. All recon output is scanned too, so secrets in archived URLs or exposed files surface.
-15. Flags shell environment variables baked into bundles, such as `HOME`, `PATH` and `GH_TOKEN` appearing in JS.
+16. Mirrors each URL two levels deep on the same domain: HTML, JS, CSS, JSON, sourcemaps.
+17. Fetches `.map` sourcemaps for every JS file, since they often contain original source.
+18. Probes accidental exposures: `/.env*`, `/.git/config`, `/__/firebase/init.json`, `firebase.json`, `asset-manifest.json` and similar.
+19. Extracts endpoints and secrets from JS bundles with jsluice/LinkFinder/getJS if present.
+20. Runs TruffleHog (live key verification) and Gitleaks, plus Kingfisher, Nosey Parker, or detect-secrets if installed. All recon output is scanned too.
+21. Flags shell environment variables baked into bundles, such as `HOME`, `PATH` and `GH_TOKEN` appearing in JS.
 
-Secrets are never printed in full; output shows only the first few characters.
+Secrets are never printed in full; output shows only the first few characters. Recon warnings (open zone transfer, wildcard DNS, reflected CORS, missing SPF/DMARC, possible takeover, open buckets, etc.) are summarized under **Recon findings** at the end of the run.
 
 ## Output
 
@@ -65,8 +80,6 @@ Secrets are never printed in full; output shows only the first few characters.
 |---|---|
 | `[LIVE]` | The provider confirmed the key works. Rotate it now. |
 | `[unverified]` | The value matched a pattern but wasn't confirmed live. Firebase `AIza…` web keys are public by design. |
-
-Recon warnings (open zone transfer, wildcard DNS, reflected CORS, etc.) are summarized under **Recon findings** at the end of the run.
 
 ## Exit codes
 
