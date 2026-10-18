@@ -75,7 +75,7 @@ Passive recon runs by default. **Subdomains discovered via Certificate Transpare
 
 ### Crawl + scan (always)
 
-16. Mirrors each URL two levels deep on the same domain: HTML, JS, CSS, JSON, sourcemaps.
+16. Mirrors each URL two levels deep on the same domain: HTML, JS, CSS, JSON, sourcemaps. Every fetch is time-bounded (per-request timeouts plus an overall per-host cap), so an unreachable or very slow host is skipped with a note on stderr instead of stalling the whole run.
 17. Fetches `.map` sourcemaps for every JS file, since they often contain original source.
 18. Probes accidental exposures: `/.env*`, `/.git/config`, `/__/firebase/init.json`, `firebase.json`, `asset-manifest.json` and similar.
 19. Extracts endpoints and secrets from JS bundles with jsluice/LinkFinder/getJS if present.
