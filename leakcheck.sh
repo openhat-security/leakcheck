@@ -354,9 +354,12 @@ if [ "$SCAN_SUBS" = "1" ]; then
 fi
 
 # Phase 3: crawl + probe every target (input URLs + live subdomains)
+tn=${#TARGETS[@]}; ti=0
 for u in "${TARGETS[@]}"; do
+  ti=$((ti+1))
   BASE=$(echo "$u" | sed -E 's#(https?://[^/]+).*#\1#')
   DOMAIN=$(echo "$BASE" | sed -E 's#https?://##')
+  echo "  [crawl] ($ti/$tn) $DOMAIN"
   wget -q -e robots=off -U "$UA" -r -l 2 -np -H -D "$DOMAIN" \
        -A 'html,htm,js,mjs,cjs,css,json,map,txt,env,xml,webmanifest' -P site "$u"
   for p in .env .env.local .env.production .env.development .git/config config.js env.js settings.json \
@@ -381,15 +384,84 @@ if have jsluice || have linkfinder || have getJS; then
   [ -s site/js_endpoints.txt ] && echo "  $(wc -l < site/js_endpoints.txt | tr -d ' ') endpoints/strings -> site/js_endpoints.txt"
 fi
 
+# --- streaming findings output ---------------------------------------------
+# Findings are appended the moment they're discovered, to both a CSV and a
+# newline-delimited JSON file, with each write flushed to disk. A long or
+# killed/interrupted run therefore still leaves the findings it already saw on
+# disk, instead of losing everything because the file was only written at the
+# very end. The deduped text reports (th.txt/gl.txt/...) and the final summary
+# are produced exactly as before, so -o DIR keeps working the same way.
+FINDINGS_CSV=""
+FINDINGS_JSONL=""
+FOUND_N=0
+if [ -n "$OUT_DIR" ]; then
+  FINDINGS_CSV="$OUT_DIR/findings.csv"
+  FINDINGS_JSONL="$OUT_DIR/findings.jsonl"
+  echo "type,detail,file,status,value" > "$FINDINGS_CSV"
+  : > "$FINDINGS_JSONL"
+fi
+
+# emit_finding TYPE DETAIL FILE STATUS VALUE
+# Append one finding to the streaming CSV + JSONL (when -o DIR is set) and bump
+# the live counter. jq does the CSV/JSON quoting so a raw secret value with
+# commas/quotes/newlines stays intact. Each call reopens and closes the files,
+# so the row is flushed before the next scan step runs.
+emit_finding() {
+  FOUND_N=$((FOUND_N + 1))
+  if [ -n "$FINDINGS_CSV" ]; then
+    jq -rn --arg t "$1" --arg d "$2" --arg f "$3" --arg s "$4" --arg v "$5" \
+      '[$t,$d,$f,$s,$v]|@csv' >> "$FINDINGS_CSV"
+    jq -cn --arg t "$1" --arg d "$2" --arg f "$3" --arg s "$4" --arg v "$5" \
+      '{type:$t,detail:$d,file:$f,status:$s,value:$v}' >> "$FINDINGS_JSONL"
+  fi
+}
+
 n=$(find site -type f | wc -l | tr -d ' ')
 echo ""
 echo "Scanned $n files from: $*"
+
+# --- TruffleHog: stream each hit the moment it is reported -------------------
+# trufflehog --json emits one JSON object per finding as it goes, so we read it
+# line by line (process substitution keeps the counter in this shell) and write
+# each finding out immediately, with a live progress line on stderr.
 echo "=== TruffleHog (verified = key is LIVE) ==="
-trufflehog filesystem site --no-update --json 2>/dev/null > th.json
-jq -r '"[\(if .Verified then "LIVE" else "unverified" end)] \(.DetectorName)  \(.SourceMetadata.Data.Filesystem.file | sub("^site/";""))  -> \(.Raw[0:6])…"' th.json 2>/dev/null | sort -u | tee th.txt
+: > th.json; : > th.txt
+while IFS= read -r line; do
+  [ -z "$line" ] && continue
+  printf '%s\n' "$line" >> th.json
+  det=$(printf '%s' "$line" | jq -r '.DetectorName // empty' 2>/dev/null)
+  [ -z "$det" ] && continue
+  ver=$(printf '%s' "$line" | jq -r 'if .Verified then "LIVE" else "unverified" end' 2>/dev/null)
+  file=$(printf '%s' "$line" | jq -r '(.SourceMetadata.Data.Filesystem.file // "") | sub("^site/";"")' 2>/dev/null)
+  raw=$(printf '%s' "$line" | jq -r '.Raw // ""' 2>/dev/null)
+  prefix=$(printf '%s' "$raw" | cut -c1-6)
+  printf '[%s] %s  %s  -> %s…\n' "$ver" "$det" "$file" "$prefix" | tee -a th.txt
+  emit_finding "secret:trufflehog" "$det" "$file" "$ver" "$raw"
+  printf '  [scan] trufflehog: %s (%s) in %s — %d finding(s) so far\n' "$det" "$ver" "$file" "$FOUND_N" >&2
+done < <(trufflehog filesystem site --no-update --json 2>/dev/null)
+[ -s th.txt ] && sort -u -o th.txt th.txt
+
+# --- Gitleaks: write its report, then stream each row -----------------------
+# gitleaks writes its JSON array at the end, so we walk the report and emit each
+# finding (still flushed per row) with the same live progress counter.
 echo "=== Gitleaks ==="
+: > gl.txt
 gitleaks dir site --no-banner --report-format json --report-path gl.json >/dev/null 2>&1
-jq -r '.[] | "[\(.RuleID)]  \(.File | sub(".*/site/";""))  -> \(.Secret[0:8])"' gl.json 2>/dev/null | sort -u | tee gl.txt
+if [ -s gl.json ]; then
+  while IFS= read -r row; do
+    [ -z "$row" ] && continue
+    rid=$(printf '%s' "$row" | jq -r '.RuleID // empty' 2>/dev/null)
+    [ -z "$rid" ] && continue
+    file=$(printf '%s' "$row" | jq -r '(.File // "") | sub(".*/site/";"")' 2>/dev/null)
+    secret=$(printf '%s' "$row" | jq -r '.Secret // ""' 2>/dev/null)
+    prefix=$(printf '%s' "$secret" | cut -c1-8)
+    printf '[%s]  %s  -> %s\n' "$rid" "$file" "$prefix" | tee -a gl.txt
+    emit_finding "secret:gitleaks" "$rid" "$file" "match" "$secret"
+    printf '  [scan] gitleaks: %s in %s — %d finding(s) so far\n' "$rid" "$file" "$FOUND_N" >&2
+  done < <(jq -c '.[]' gl.json 2>/dev/null)
+  [ -s gl.txt ] && sort -u -o gl.txt gl.txt
+fi
+
 : > kf.txt
 if have kingfisher; then
   echo "=== Kingfisher ==="
@@ -403,10 +475,13 @@ elif have detect-secrets; then
 fi
 echo "=== Shell env baked into bundle? ==="
 grep -rlE '"(HOME|USER|SHELL|PATH|CURSOR_AGENT|TERM_PROGRAM|GH_TOKEN|GITHUB_TOKEN)" *: *"' site 2>/dev/null | sed 's#^site/##' | tee env.txt
+while IFS= read -r f; do [ -n "$f" ] && emit_finding "bundle:shell-env" "shell env vars baked into bundle" "$f" "warning" ""; done < env.txt
 echo "=== Exposed files that returned content ==="
 find site -name 'exposed_*' -size +0 | sed 's#^site/exposed_##' | grep -vE 'robots|sitemap|security.txt|manifest' | tee exp.txt
+while IFS= read -r f; do [ -n "$f" ] && emit_finding "exposed-file" "returned content" "$f" "warning" ""; done < exp.txt
 echo "=== Recon findings (warnings) ==="
 grep -rhi 'WARNING' site/recon_* 2>/dev/null | sort -u | tee recon_warn.txt
+while IFS= read -r w; do [ -n "$w" ] && emit_finding "recon-warning" "$(echo "$w" | sed 's/^WARNING: //')" "" "warning" ""; done < recon_warn.txt
 
 live=$(grep -c '^\[LIVE\]' th.txt 2>/dev/null || true); live=${live:-0}
 total=$(( $(wc -l < th.txt) + $( [ -f gl.txt ] && wc -l < gl.txt || echo 0) + $( [ -f kf.txt ] && wc -l < kf.txt || echo 0) + $(wc -l < env.txt) ))
@@ -414,24 +489,24 @@ reconw=$( [ -f recon_warn.txt ] && wc -l < recon_warn.txt | tr -d ' ' || echo 0 
 expc=$( [ -f exp.txt ] && wc -l < exp.txt | tr -d ' ' || echo 0 )
 anyfind=$(( total + reconw + expc ))
 
-# Save crawl + recon artifacts and a findings CSV when -o DIR is given
+# Save crawl + recon artifacts when -o DIR is given. findings.csv / findings.jsonl
+# were already streamed above; here we just finalize (de-duplicate) them and copy
+# the rest. A clean run leaves no findings file behind, as before.
 if [ -n "$OUT_DIR" ]; then
   mkdir -p "$OUT_DIR"
   cp -R site "$OUT_DIR/" 2>/dev/null
   for r in th.txt th.json gl.txt gl.json kf.txt env.txt exp.txt recon_warn.txt; do [ -f "$r" ] && cp "$r" "$OUT_DIR/" 2>/dev/null; done
   if [ "$anyfind" -gt 0 ]; then
-    CSV="$OUT_DIR/findings.csv"
-    {
-      echo "type,detail,file,status,value"
-      [ -f th.json ] && jq -r 'select(.DetectorName) | ["secret:trufflehog", .DetectorName, (.SourceMetadata.Data.Filesystem.file|sub("^site/";"")), (if .Verified then "LIVE" else "unverified" end), (.Raw // "")] | @csv' th.json 2>/dev/null | sort -u
-      [ -f gl.json ] && jq -r '.[] | ["secret:gitleaks", .RuleID, (.File|sub(".*/site/";"")), "match", (.Secret // "")] | @csv' gl.json 2>/dev/null | sort -u
-      while IFS= read -r f; do [ -n "$f" ] && printf '"bundle:shell-env","shell env vars baked into bundle","%s","warning",""\n' "$f"; done < env.txt
-      while IFS= read -r f; do [ -n "$f" ] && printf '"exposed-file","returned content","%s","warning",""\n' "$f"; done < exp.txt
-      while IFS= read -r w; do [ -n "$w" ] && printf '"recon-warning","%s","","warning",""\n' "$(echo "$w" | sed 's/^WARNING: //; s/\"/\"\"/g')"; done < recon_warn.txt
-    } > "$CSV"
-    echo "Saved crawl + recon to $OUT_DIR/  (findings CSV: $CSV)"
+    # de-duplicate the streamed findings in place (keep the CSV header row first)
+    if [ -f "$FINDINGS_CSV" ]; then
+      { head -n 1 "$FINDINGS_CSV"; tail -n +2 "$FINDINGS_CSV" | sort -u; } > "$FINDINGS_CSV.tmp" && mv "$FINDINGS_CSV.tmp" "$FINDINGS_CSV"
+    fi
+    [ -f "$FINDINGS_JSONL" ] && sort -u -o "$FINDINGS_JSONL" "$FINDINGS_JSONL"
+    echo "Saved crawl + recon to $OUT_DIR/  (findings: $FINDINGS_CSV + $(basename "$FINDINGS_JSONL"))"
   else
-    echo "Saved crawl + recon to $OUT_DIR/  (clean - no findings.csv written)"
+    # clean run: drop the empty streamed findings files
+    rm -f "$FINDINGS_CSV" "$FINDINGS_JSONL" 2>/dev/null
+    echo "Saved crawl + recon to $OUT_DIR/  (clean - no findings file written)"
   fi
 fi
 
