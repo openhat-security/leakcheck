@@ -45,7 +45,7 @@ Set `SHODAN_API_KEY` to enable Shodan lookups.
 | Flag | Effect |
 |---|---|
 | `--active` | Adds scans that touch the target directly: port/banner scan, directory brute force, nuclei, zone-transfer attempts, subdomain brute. Authorized targets only. |
-| `-o DIR` / `--out DIR` | Keeps the crawled `site/` mirror and every `recon_<domain>/` artifact in `DIR`, and writes `findings.csv` there when anything is flagged. Without `-o`, all crawled files are deleted at the end and only the summary prints. |
+| `-o DIR` / `--out DIR` | Keeps the crawled `site/` mirror and every `recon_<domain>/` artifact in `DIR`, and streams findings to `findings.csv` and `findings.jsonl` there **as each one is discovered** (so a long or interrupted run still leaves partial results on disk). Without `-o`, all crawled files are deleted at the end and only the summary prints. |
 | `--no-subs` | Scans only the URLs you pass. By default, every live subdomain discovered during recon is crawled and scanned too. |
 
 Passive recon runs by default. **Subdomains discovered via Certificate Transparency (and optional tools) are liveness-probed and the reachable ones are automatically crawled and scanned.** Use `--no-subs` to limit the scan to the exact URLs you pass.
@@ -79,7 +79,7 @@ Passive recon runs by default. **Subdomains discovered via Certificate Transpare
 17. Fetches `.map` sourcemaps for every JS file, since they often contain original source.
 18. Probes accidental exposures: `/.env*`, `/.git/config`, `/__/firebase/init.json`, `firebase.json`, `asset-manifest.json` and similar.
 19. Extracts endpoints and secrets from JS bundles with jsluice/LinkFinder/getJS if present.
-20. Runs TruffleHog (live key verification) and Gitleaks, plus Kingfisher, Nosey Parker, or detect-secrets if installed. All recon output is scanned too.
+20. Runs TruffleHog (live key verification) and Gitleaks, plus Kingfisher, Nosey Parker, or detect-secrets if installed. All recon output is scanned too. Each finding is printed and written out the moment it is found, with a live progress line on stderr (`[scan] <tool>: <detector> in <file> — N finding(s) so far`) so a long verification pass never looks frozen.
 21. Flags shell environment variables baked into bundles, such as `HOME`, `PATH` and `GH_TOKEN` appearing in JS.
 
 Secrets are never printed in full; output shows only the first few characters. Recon warnings (open zone transfer, wildcard DNS, reflected CORS, missing SPF/DMARC, possible takeover, open buckets, etc.) are summarized under **Recon findings** at the end of the run.
@@ -90,7 +90,10 @@ With `-o DIR`, the run leaves behind:
 
 - `DIR/site/` — the full crawled mirror plus `recon_<domain>/` directories (DNS, subdomains, WHOIS, headers, TLS, etc.).
 - `DIR/th.txt`, `DIR/gl.txt`, `DIR/th.json`, `DIR/gl.json` — raw TruffleHog/Gitleaks results.
-- `DIR/findings.csv` — one row per finding (written only when something is flagged), columns: `type,detail,file,status,value`. `type` is `secret:trufflehog`, `secret:gitleaks`, `bundle:shell-env`, `exposed-file`, or `recon-warning`; `status` is `LIVE`, `unverified`, `match`, or `warning`. The `value` column contains the **full raw secret** (properly CSV-escaped) so it can be fed straight into rotation tooling — treat `findings.csv` as sensitive and do not commit it.
+- `DIR/findings.csv` — one row per finding, columns: `type,detail,file,status,value`. `type` is `secret:trufflehog`, `secret:gitleaks`, `bundle:shell-env`, `exposed-file`, or `recon-warning`; `status` is `LIVE`, `unverified`, `match`, or `warning`. The `value` column contains the **full raw secret** (properly CSV-escaped) so it can be fed straight into rotation tooling — treat it as sensitive and do not commit it.
+- `DIR/findings.jsonl` — the same findings as newline-delimited JSON, one object per line.
+
+Both findings files are **appended and flushed the instant each finding is discovered**, not written once at the end, so a killed or still-running scan leaves the findings seen so far on disk. On completion they are de-duplicated in place; on a fully clean run they are removed so an empty file is never left behind.
 
 ## Output
 
