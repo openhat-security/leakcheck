@@ -354,24 +354,41 @@ if [ "$SCAN_SUBS" = "1" ]; then
 fi
 
 # Phase 3: crawl + probe every target (input URLs + live subdomains)
+# Every fetch here is bounded so one dead or slow host can't stall the whole run:
+#   wget --timeout/--tries cap each request (wget otherwise retries 20x with
+#   backoff, which looks like a permanent hang on an unreachable host), and the
+#   `timeout` wrapper caps the whole recursive mirror per host. On a timeout or
+#   network failure we print a note to stderr and move on to the next target.
+WGET_REQ_TIMEOUT=10       # per connect/dns/read attempt (seconds)
+WGET_TRIES=2              # not wget's default of 20
+CRAWL_HOST_TIMEOUT=180    # overall wall-clock cap for one host's mirror
+PROBE_TIMEOUT=15          # per exposed-file / sourcemap request (seconds)
 tn=${#TARGETS[@]}; ti=0
 for u in "${TARGETS[@]}"; do
   ti=$((ti+1))
   BASE=$(echo "$u" | sed -E 's#(https?://[^/]+).*#\1#')
   DOMAIN=$(echo "$BASE" | sed -E 's#https?://##')
   echo "  [crawl] ($ti/$tn) $DOMAIN"
-  wget -q -e robots=off -U "$UA" -r -l 2 -np -H -D "$DOMAIN" \
-       -A 'html,htm,js,mjs,cjs,css,json,map,txt,env,xml,webmanifest' -P site "$u"
+  wget_cmd=(wget -q -e robots=off -U "$UA" -r -l 2 -np -H -D "$DOMAIN" \
+    --timeout="$WGET_REQ_TIMEOUT" --tries="$WGET_TRIES" --waitretry=2 \
+    -A 'html,htm,js,mjs,cjs,css,json,map,txt,env,xml,webmanifest' -P site "$u")
+  if have timeout; then timeout "$CRAWL_HOST_TIMEOUT" "${wget_cmd[@]}"; rc=$?; else "${wget_cmd[@]}"; rc=$?; fi
+  case "$rc" in
+    0|8) : ;;  # 0 = ok; 8 = only server error responses (e.g. 404s), normal for a recursive crawl
+    124) echo "  [crawl] ($ti/$tn) $DOMAIN: crawl exceeded ${CRAWL_HOST_TIMEOUT}s, moving on" >&2 ;;
+    4)   echo "  [crawl] ($ti/$tn) $DOMAIN: network failure / unreachable, moving on" >&2 ;;
+    *)   echo "  [crawl] ($ti/$tn) $DOMAIN: wget stopped (rc=$rc), moving on" >&2 ;;
+  esac
   for p in .env .env.local .env.production .env.development .git/config config.js env.js settings.json \
            asset-manifest.json manifest.json firebase.json __/firebase/init.json __/firebase/init.js \
            .well-known/security.txt robots.txt sitemap.xml _next/static/chunks/webpack.js; do
-    curl -sfL -A "$UA" "$BASE/$p" -o "site/exposed_${DOMAIN}_$(echo "$p" | tr '/' '_')" 2>/dev/null
+    curl -sfL -m "$PROBE_TIMEOUT" --connect-timeout 10 -A "$UA" "$BASE/$p" -o "site/exposed_${DOMAIN}_$(echo "$p" | tr '/' '_')" 2>/dev/null
   done
 done
 
 # Fetch sourcemaps for every JS file
 find site -name '*.js' | while read -r f; do
-  rel=${f#site/}; curl -sfL -A "$UA" "https://$rel.map" -o "$f.map" 2>/dev/null
+  rel=${f#site/}; curl -sfL -m "$PROBE_TIMEOUT" --connect-timeout 10 -A "$UA" "https://$rel.map" -o "$f.map" 2>/dev/null
 done
 
 # Extract endpoints/secrets from JS bundles (optional tools)
